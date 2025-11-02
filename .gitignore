@@ -1,7 +1,5 @@
 # Pliki wykonywalne
-log_seq
-log_openmp
-gen_logs
+bin/
 
 # Katalogi wyników i danych
 /results/*
@@ -21,3 +19,4 @@ gen_logs
 # Systemowe
 .DS_Store
 Thumbs.db
+
