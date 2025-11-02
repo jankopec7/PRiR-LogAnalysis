@@ -1,0 +1,23 @@
+# Pliki wykonywalne
+log_seq
+log_openmp
+gen_logs
+
+# Katalogi wyników i danych
+/results/*
+!/results/.gitkeep
+/data/*
+!/data/.gitkeep
+
+# Pliki tymczasowe i kopie
+*.o
+*.out
+*.tmp
+*.swp
+*.bak
+*.csv
+*.txt~
+
+# Systemowe
+.DS_Store
+Thumbs.db
