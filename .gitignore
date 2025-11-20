@@ -6,6 +6,7 @@ bin/
 !/results/.gitkeep
 /data/*
 !/data/.gitkeep
+/Hadoop/
 
 # Pliki tymczasowe i kopie
 *.o
