@@ -3,133 +3,232 @@
 #include <string.h>
 #include <cuda_runtime.h>
 
-#define LINE_SIZE 512
-#define MAX_LINES 200000
+#define THREADS_PER_BLOCK 256
 
-// ===============================
-// DEVICE: funkcja pomocnicza
-// ===============================
-__device__ int contains_keyword(const char *line, const char *keyword) {
-    int i = 0;
-    while (line[i] != '\0') {
-        int j = 0;
-        while (keyword[j] != '\0' && line[i + j] != '\0' && line[i + j] == keyword[j]) {
-            j++;
+// Makro do sprawdzania błędów CUDA
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err = (call);                                             \
+        if (err != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error %s:%d: %s\n",                         \
+                    __FILE__, __LINE__, cudaGetErrorString(err));             \
+            exit(EXIT_FAILURE);                                               \
+        }                                                                     \
+    } while (0)
+
+// Kernel: każdy wątek przetwarza kilka linii logów
+__global__ void count_levels_kernel(
+    const char *buffer,
+    const int *line_starts,
+    int num_lines,
+    int buffer_len,
+    unsigned long long *info_count,
+    unsigned long long *warn_count,
+    unsigned long long *error_count)
+{
+    unsigned long long local_info  = 0;
+    unsigned long long local_warn  = 0;
+    unsigned long long local_error = 0;
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int line_idx = tid; line_idx < num_lines; line_idx += stride) {
+        int start = line_starts[line_idx];
+        int end = (line_idx + 1 < num_lines) ? line_starts[line_idx + 1] : buffer_len;
+
+        if (start >= buffer_len || start >= end)
+            continue;
+
+        int has_info = 0, has_warn = 0, has_error = 0;
+
+        // Przeszukujemy linię znak po znaku
+        for (int i = start; i < end; ++i) {
+            char c = buffer[i];
+
+            // INFO
+            if (!has_info && c == 'I' && i + 3 < end) {
+                if (buffer[i + 1] == 'N' &&
+                    buffer[i + 2] == 'F' &&
+                    buffer[i + 3] == 'O') {
+                    has_info = 1;
+                }
+            }
+
+            // WARN (pasuje też WARNING, bo początek to WARN)
+            if (!has_warn && c == 'W' && i + 3 < end) {
+                if (buffer[i + 1] == 'A' &&
+                    buffer[i + 2] == 'R' &&
+                    buffer[i + 3] == 'N') {
+                    has_warn = 1;
+                }
+            }
+
+            // ERROR
+            if (!has_error && c == 'E' && i + 4 < end) {
+                if (buffer[i + 1] == 'R' &&
+                    buffer[i + 2] == 'R' &&
+                    buffer[i + 3] == 'O' &&
+                    buffer[i + 4] == 'R') {
+                    has_error = 1;
+                }
+            }
+
+            if (has_info && has_warn && has_error) {
+                break;
+            }
         }
-        if (keyword[j] == '\0') return 1; // znaleziono
-        i++;
+
+        if (has_info)  local_info++;
+        if (has_warn)  local_warn++;
+        if (has_error) local_error++;
     }
-    return 0;
+
+    if (local_info > 0)  atomicAdd(info_count,  local_info);
+    if (local_warn > 0)  atomicAdd(warn_count,  local_warn);
+    if (local_error > 0) atomicAdd(error_count, local_error);
 }
 
-// ===============================
-// KERNEL CUDA
-// ===============================
-__global__ void count_logs_kernel(char *data, int *line_starts, int num_lines, int *info, int *warn, int *error) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_lines) return;
-
-    char *line = data + line_starts[idx];
-
-    if (contains_keyword(line, "INFO")) atomicAdd(info, 1);
-    else if (contains_keyword(line, "WARNING")) atomicAdd(warn, 1);
-    else if (contains_keyword(line, "ERROR")) atomicAdd(error, 1);
-}
-
-// ===============================
-// HOST: program główny
-// ===============================
-int main(int argc, char *argv[]) {
+int main(int argc, char **argv)
+{
     if (argc < 2) {
         fprintf(stderr, "Użycie: %s <plik_logów>\n", argv[0]);
-        return 1;
+        return EXIT_FAILURE;
     }
 
     const char *filename = argv[1];
-    FILE *f = fopen(filename, "r");
+
+    // --- Wczytanie pliku na CPU ---
+    FILE *f = fopen(filename, "rb");
     if (!f) {
-        perror("Błąd otwarcia pliku");
-        return 1;
+        perror("Nie można otworzyć pliku");
+        return EXIT_FAILURE;
     }
 
-    // Wczytaj cały plik
-    fseek(f, 0, SEEK_END);
-    long filesize = ftell(f);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("fseek");
+        fclose(f);
+        return EXIT_FAILURE;
+    }
+
+    long file_size = ftell(f);
+    if (file_size < 0) {
+        perror("ftell");
+        fclose(f);
+        return EXIT_FAILURE;
+    }
     rewind(f);
 
-    char *data = (char *)malloc(filesize + 1);
-    fread(data, 1, filesize, f);
-    data[filesize] = '\0';
-    fclose(f);
-
-    // Znajdź początki linii
-    int *line_starts = (int *)malloc(MAX_LINES * sizeof(int));
-    int num_lines = 0;
-    line_starts[num_lines++] = 0;
-
-    for (long i = 0; i < filesize; i++) {
-        if (data[i] == '\n' && i + 1 < filesize) {
-            line_starts[num_lines++] = i + 1;
-        }
-        if (num_lines >= MAX_LINES) break;
+    char *buffer = (char *)malloc(file_size);
+    if (!buffer) {
+        fprintf(stderr, "Błąd: brak pamięci na buffer.\n");
+        fclose(f);
+        return EXIT_FAILURE;
     }
 
-    // ===============================
-    // Alokacja pamięci na GPU
-    // ===============================
-    char *d_data;
-    int *d_line_starts;
-    int *d_info, *d_warn, *d_error;
+    size_t read_bytes = fread(buffer, 1, file_size, f);
+    fclose(f);
 
-    cudaMalloc(&d_data, filesize + 1);
-    cudaMalloc(&d_line_starts, num_lines * sizeof(int));
-    cudaMalloc(&d_info, sizeof(int));
-    cudaMalloc(&d_warn, sizeof(int));
-    cudaMalloc(&d_error, sizeof(int));
+    if (read_bytes != (size_t)file_size) {
+        fprintf(stderr, "Uwaga: odczytano mniej bajtów niż rozmiar pliku.\n");
+        file_size = (long)read_bytes;
+    }
 
-    cudaMemcpy(d_data, data, filesize + 1, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_line_starts, line_starts, num_lines * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemset(d_info, 0, sizeof(int));
-    cudaMemset(d_warn, 0, sizeof(int));
-    cudaMemset(d_error, 0, sizeof(int));
+    // --- Wyznaczanie początków linii ---
+    int approx_lines = 1;
+    for (long i = 0; i < file_size; ++i) {
+        if (buffer[i] == '\n') approx_lines++;
+    }
 
-    // ===============================
-    // Uruchom kernel
-    // ===============================
-    int threads = 256;
-    int blocks = (num_lines + threads - 1) / threads;
+    int *line_starts = (int *)malloc(approx_lines * sizeof(int));
+    if (!line_starts) {
+        fprintf(stderr, "Błąd: brak pamięci na line_starts.\n");
+        free(buffer);
+        return EXIT_FAILURE;
+    }
 
-    count_logs_kernel<<<blocks, threads>>>(d_data, d_line_starts, num_lines, d_info, d_warn, d_error);
-    cudaDeviceSynchronize();
+    int num_lines = 0;
+    line_starts[num_lines++] = 0;  // pierwsza linia startuje od 0
 
-    // ===============================
-    // Pobierz wyniki
-    // ===============================
-    int h_info, h_warn, h_error;
-    cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_warn, d_warn, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_error, d_error, sizeof(int), cudaMemcpyDeviceToHost);
+    for (long i = 0; i < file_size; ++i) {
+        if (buffer[i] == '\n' && i + 1 < file_size) {
+            line_starts[num_lines++] = (int)(i + 1);
+        }
+    }
 
-    // ===============================
-    // Wynik
-    // ===============================
-    printf("=== Analiza logów (CUDA) ===\n");
+    // --- Alokacja na GPU ---
+    char *d_buffer = NULL;
+    int  *d_line_starts = NULL;
+    unsigned long long *d_info = NULL, *d_warn = NULL, *d_error = NULL;
+
+    CUDA_CHECK(cudaMalloc((void **)&d_buffer, file_size));
+    CUDA_CHECK(cudaMalloc((void **)&d_line_starts, num_lines * sizeof(int)));
+    CUDA_CHECK(cudaMalloc((void **)&d_info,  sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc((void **)&d_warn,  sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc((void **)&d_error, sizeof(unsigned long long)));
+
+    CUDA_CHECK(cudaMemcpy(d_buffer, buffer, file_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_line_starts, line_starts,
+                          num_lines * sizeof(int), cudaMemcpyHostToDevice));
+
+    unsigned long long zero = 0;
+    CUDA_CHECK(cudaMemcpy(d_info,  &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_warn,  &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_error, &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
+
+    // --- Uruchomienie kernela ---
+    int blocks = (num_lines + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    if (blocks < 1) blocks = 1;
+    if (blocks > 1024) blocks = 1024;  // bezpieczeństwo
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+
+    count_levels_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+        d_buffer,
+        d_line_starts,
+        num_lines,
+        (int)file_size,
+        d_info,
+        d_warn,
+        d_error
+    );
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    // --- Odczyt wyników ---
+    unsigned long long h_info = 0, h_warn = 0, h_error = 0;
+    CUDA_CHECK(cudaMemcpy(&h_info,  d_info,  sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_warn,  d_warn,  sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_error, d_error, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+    // --- Wypisanie wyników ---
+    printf("=== Analiza logów (CUDA – poziomy logów) ===\n");
     printf("Plik: %s\n", filename);
-    printf("Liczba linii: %d\n", num_lines);
-    printf("INFO: %d\n", h_info);
-    printf("WARNING: %d\n", h_warn);
-    printf("ERROR: %d\n", h_error);
+    printf("Szacowana liczba linii (na podstawie \\n): %d\n", num_lines);
+    printf("INFO:   %llu\n", (unsigned long long)h_info);
+    printf("WARN:   %llu\n", (unsigned long long)h_warn);
+    printf("ERROR:  %llu\n", (unsigned long long)h_error);
+    printf("Czas kernela: %.3f ms\n", ms);
 
-    // ===============================
-    // Sprzątanie
-    // ===============================
-    cudaFree(d_data);
-    cudaFree(d_line_starts);
-    cudaFree(d_info);
-    cudaFree(d_warn);
-    cudaFree(d_error);
-    free(data);
+    // --- Sprzątanie ---
+    free(buffer);
     free(line_starts);
+
+    CUDA_CHECK(cudaFree(d_buffer));
+    CUDA_CHECK(cudaFree(d_line_starts));
+    CUDA_CHECK(cudaFree(d_info));
+    CUDA_CHECK(cudaFree(d_warn));
+    CUDA_CHECK(cudaFree(d_error));
 
     return 0;
 }

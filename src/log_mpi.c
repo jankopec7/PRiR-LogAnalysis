@@ -112,7 +112,7 @@ int main(int argc, char *argv[]) {
     }
 
     // ========================
-    // Podział pliku na chanki
+    // Podział pliku na chunk'i
     // ========================
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
