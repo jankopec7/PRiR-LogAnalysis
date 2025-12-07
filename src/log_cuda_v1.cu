@@ -16,24 +16,6 @@
         }                                                                     \
     } while (0)
 
-// Proste parsowanie godziny z początku linii logu:
-//format: "YYYY-MM-DD HH:MM:SS,..." – jak w logach Hadoop
-// Godzina to dwa znaki pod indeksem start+11 i start+12
-__device__ int parse_hour_device(const char *buffer, int start, int end) {
-    // minimalna długość, żeby zawierało datę i godzinę
-    if (end - start < 13) return -1;
-
-    char c1 = buffer[start + 11];
-    char c2 = buffer[start + 12];
-
-    if (c1 < '0' || c1 > '9' || c2 < '0' || c2 > '9') return -1;
-
-    int hour = (c1 - '0') * 10 + (c2 - '0');
-    if (hour < 0 || hour >= 24) return -1;
-
-    return hour;
-}
-
 // Kernel: każdy wątek przetwarza kilka linii logów
 __global__ void count_levels_kernel(
     const char *buffer,
@@ -42,10 +24,7 @@ __global__ void count_levels_kernel(
     int buffer_len,
     unsigned long long *info_count,
     unsigned long long *warn_count,
-    unsigned long long *error_count,
-    unsigned long long *hour_info,
-    unsigned long long *hour_warn,
-    unsigned long long *hour_error)
+    unsigned long long *error_count)
 {
     unsigned long long local_info  = 0;
     unsigned long long local_warn  = 0;
@@ -56,18 +35,12 @@ __global__ void count_levels_kernel(
 
     for (int line_idx = tid; line_idx < num_lines; line_idx += stride) {
         int start = line_starts[line_idx];
-        int end   = (line_idx + 1 < num_lines) ? line_starts[line_idx + 1]
-                                               : buffer_len;
+        int end = (line_idx + 1 < num_lines) ? line_starts[line_idx + 1] : buffer_len;
 
         if (start >= buffer_len || start >= end)
             continue;
 
-        int has_info  = 0;
-        int has_warn  = 0;
-        int has_error = 0;
-
-        // Parsujemy godzinę z początku linii
-        int hour = parse_hour_device(buffer, start, end);
+        int has_info = 0, has_warn = 0, has_error = 0;
 
         // Przeszukujemy linię znak po znaku
         for (int i = start; i < end; ++i) {
@@ -106,27 +79,13 @@ __global__ void count_levels_kernel(
             }
         }
 
-        // Sumy globalne + statystyki godzinowe
-        if (has_info) {
-            local_info++;
-            if (hour >= 0 && hour < 24)
-                atomicAdd(&hour_info[hour], 1ULL);
-        }
-        if (has_warn) {
-            local_warn++;
-            if (hour >= 0 && hour < 24)
-                atomicAdd(&hour_warn[hour], 1ULL);
-        }
-        if (has_error) {
-            local_error++;
-            if (hour >= 0 && hour < 24)
-                atomicAdd(&hour_error[hour], 1ULL);
-        }
+        if (has_info)  local_info++;
+        if (has_warn)  local_warn++;
+        if (has_error) local_error++;
     }
 
-    // Redukcja lokalnych sum (per-wątek) do liczników globalnych
-    if (local_info  > 0) atomicAdd(info_count,  local_info);
-    if (local_warn  > 0) atomicAdd(warn_count,  local_warn);
+    if (local_info > 0)  atomicAdd(info_count,  local_info);
+    if (local_warn > 0)  atomicAdd(warn_count,  local_warn);
     if (local_error > 0) atomicAdd(error_count, local_error);
 }
 
@@ -201,16 +160,12 @@ int main(int argc, char **argv)
     char *d_buffer = NULL;
     int  *d_line_starts = NULL;
     unsigned long long *d_info = NULL, *d_warn = NULL, *d_error = NULL;
-    unsigned long long *d_hour_info = NULL, *d_hour_warn = NULL, *d_hour_error = NULL;
 
     CUDA_CHECK(cudaMalloc((void **)&d_buffer, file_size));
     CUDA_CHECK(cudaMalloc((void **)&d_line_starts, num_lines * sizeof(int)));
     CUDA_CHECK(cudaMalloc((void **)&d_info,  sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void **)&d_warn,  sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc((void **)&d_error, sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMalloc((void **)&d_hour_info,  24 * sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMalloc((void **)&d_hour_warn,  24 * sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMalloc((void **)&d_hour_error, 24 * sizeof(unsigned long long)));
 
     CUDA_CHECK(cudaMemcpy(d_buffer, buffer, file_size, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_line_starts, line_starts,
@@ -220,9 +175,6 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(d_info,  &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_warn,  &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_error, &zero, sizeof(unsigned long long), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_hour_info,  0, 24 * sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMemset(d_hour_warn,  0, 24 * sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMemset(d_hour_error, 0, 24 * sizeof(unsigned long long)));
 
     // --- Uruchomienie kernela ---
     int blocks = (num_lines + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
@@ -241,10 +193,7 @@ int main(int argc, char **argv)
         (int)file_size,
         d_info,
         d_warn,
-        d_error,
-        d_hour_info,
-        d_hour_warn,
-        d_hour_error
+        d_error
     );
 
     CUDA_CHECK(cudaEventRecord(stop));
@@ -258,36 +207,18 @@ int main(int argc, char **argv)
 
     // --- Odczyt wyników ---
     unsigned long long h_info = 0, h_warn = 0, h_error = 0;
-    unsigned long long h_hour_info[24];
-    unsigned long long h_hour_warn[24];
-    unsigned long long h_hour_error[24];
-
     CUDA_CHECK(cudaMemcpy(&h_info,  d_info,  sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&h_warn,  d_warn,  sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(&h_error, d_error, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaMemcpy(h_hour_info,  d_hour_info,  24 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_hour_warn,  d_hour_warn,  24 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_hour_error, d_hour_error, 24 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-
     // --- Wypisanie wyników ---
-    printf("=== Analiza logów (CUDA – poziomy logów + statystyki godzinowe) ===\n");
+    printf("=== Analiza logów (CUDA – poziomy logów) ===\n");
     printf("Plik: %s\n", filename);
     printf("Szacowana liczba linii (na podstawie \\n): %d\n", num_lines);
     printf("INFO:   %llu\n", (unsigned long long)h_info);
     printf("WARN:   %llu\n", (unsigned long long)h_warn);
     printf("ERROR:  %llu\n", (unsigned long long)h_error);
     printf("Czas kernela: %.3f ms\n", ms);
-
-    printf("\nStatystyki godzinowe (CUDA):\n");
-    printf("Godz   INFO      WARN      ERROR\n");
-    for (int h = 0; h < 24; h++) {
-        printf("%02d   %8llu  %8llu  %8llu\n",
-               h,
-               (unsigned long long)h_hour_info[h],
-               (unsigned long long)h_hour_warn[h],
-               (unsigned long long)h_hour_error[h]);
-    }
 
     // --- Sprzątanie ---
     free(buffer);
@@ -298,9 +229,6 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaFree(d_info));
     CUDA_CHECK(cudaFree(d_warn));
     CUDA_CHECK(cudaFree(d_error));
-    CUDA_CHECK(cudaFree(d_hour_info));
-    CUDA_CHECK(cudaFree(d_hour_warn));
-    CUDA_CHECK(cudaFree(d_hour_error));
 
     return 0;
 }

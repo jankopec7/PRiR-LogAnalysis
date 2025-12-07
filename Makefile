@@ -1,6 +1,6 @@
 # ============================
-# Analiza logów systemowych
-# Programowanie Równoległe i Rozproszone
+# PRiR – Analiza logów systemowych
+# Makefile – SEQ / OpenMP / MPI / CUDA
 # ============================
 
 # Kompilatory
@@ -11,6 +11,7 @@ NVCC   = nvcc
 # Flagi
 CFLAGS   = -O3 -Wall
 OMPFLAGS = -fopenmp
+MPI_WARN   = -Wno-unused-result
 
 # Foldery
 SRC_DIR     = src
@@ -18,17 +19,18 @@ DATA_DIR    = data
 RESULTS_DIR = results
 BIN_DIR     = bin
 
-# Pliki wynikowe
-SEQ    = $(BIN_DIR)/log_seq
-OPENMP = $(BIN_DIR)/log_openmp
-MPI    = $(BIN_DIR)/log_mpi
-CUDA   = $(BIN_DIR)/log_cuda
+# Wynikowe pliki wykonywalne
+SEQ_BIN    = $(BIN_DIR)/log_seq
+OPENMP_BIN = $(BIN_DIR)/log_openmp
+MPI_BIN    = $(BIN_DIR)/log_mpi
+CUDA_BIN   = $(BIN_DIR)/log_cuda
 
 # ============================
 # Zadania główne
 # ============================
 
-all: prepare seq openmp mpi cuda
+all: prepare $(SEQ_BIN) $(OPENMP_BIN) $(MPI_BIN) $(CUDA_BIN)
+	@echo "Kompilacja wszystkich modułów zakończona."
 
 prepare:
 	mkdir -p $(BIN_DIR) $(RESULTS_DIR)
@@ -37,29 +39,42 @@ prepare:
 # Wersja sekwencyjna (CPU)
 # ============================
 
-seq: prepare
-	$(CC) $(CFLAGS) -o $(SEQ) $(SRC_DIR)/log_seq.c
+seq: $(SEQ_BIN)
+
+$(SEQ_BIN): $(SRC_DIR)/log_seq.c
+	@echo "[SEQ]    Kompiluję wersję sekwencyjną..."
+	$(CC) $(CFLAGS) -o $@ $<
 
 # ============================
 # Wersja OpenMP
 # ============================
 
-openmp: prepare
-	$(CC) $(CFLAGS) $(OMPFLAGS) -o $(OPENMP) $(SRC_DIR)/log_openmp.c
+openmp: $(OPENMP_BIN)
+
+$(OPENMP_BIN): $(SRC_DIR)/log_openmp.c
+	@echo "[OpenMP] Kompiluję wersję OpenMP..."
+	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $<
+
 
 # ============================
 # Wersja MPI
 # ============================
 
-mpi: prepare
-	$(MPICC) $(CFLAGS) -o $(MPI) $(SRC_DIR)/log_mpi.c
+mpi: $(MPI_BIN)
+
+$(MPI_BIN): $(SRC_DIR)/log_mpi.c
+	@echo "[MPI]    Kompiluję wersję MPI..."
+	$(MPICC) $(CFLAGS) $(MPI_WARN) -o $@ $<
 
 # ============================
 # Wersja CUDA
 # ============================
 
-cuda: prepare
-	$(NVCC) -O3 -o $(CUDA) $(SRC_DIR)/log_cuda.cu
+cuda: $(CUDA_BIN)
+
+$(CUDA_BIN): $(SRC_DIR)/log_cuda.cu
+	@echo "[CUDA]   Kompiluję wersję CUDA..."
+	$(NVCC) -O3 -o $@ $<
 
 # ============================
 # Czyszczenie
@@ -68,5 +83,6 @@ cuda: prepare
 clean:
 	rm -rf $(BIN_DIR)/*
 	rm -f $(RESULTS_DIR)/*.txt
+	@echo "Wyczyszczono pliki binarne i wyniki."
 
-.PHONY: all prepare seq openmp mpi cuda clean
+.PHONY: all prepare clean seq openmp mpi cuda

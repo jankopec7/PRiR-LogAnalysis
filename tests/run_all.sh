@@ -70,7 +70,7 @@ done
 echo
 
 # ===============================
-# MPI
+# MPI – standard tests
 # ===============================
 echo ">>> MPI tests"
 for np in 1 2 4 6; do
@@ -81,6 +81,23 @@ for np in 1 2 4 6; do
     echo "      time = $TIME s"
 done
 echo
+
+
+# ===============================
+# MPI – oversubscribe tests
+# ===============================
+echo ">>> MPI oversubscribe tests"
+for np in 8 12; do
+    echo "   mpirun --oversubscribe -np $np"
+    OUT="$RESULTS/outputs/mpi_${np}_oversub.txt"
+    TIME=$(START=$(date +%s.%N); mpirun --oversubscribe -np $np $MPI $LOGFILE > "$OUT"; END=$(date +%s.%N); echo "$END - $START" | bc)
+
+    echo "MPI-oversub,$np,$TIME" >> "$CSV"
+
+    echo "      time = $TIME s"
+done
+echo
+
 
 # ===============================
 # CUDA
