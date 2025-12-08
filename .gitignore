@@ -4,7 +4,6 @@ bin/
 # Katalogi wyników i danych
 /results/*
 !/results/.gitkeep
-/data/*
 !/data/.gitkeep
 /Hadoop/
 

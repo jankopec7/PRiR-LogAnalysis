@@ -7,7 +7,7 @@
 #define LINE_SIZE 2048
 #define INITIAL_WORD_CAP 1024
 #define TOP_N 10
-#define MAX_LINES 1000000  // można zwiększyć w razie czego
+#define MAX_LINES 400000
 
 typedef struct {
     char *word;

@@ -16,6 +16,7 @@ typedef struct {
     long count;
 } WordCount;
 
+// Dodanie słowa lokalnie
 static void add_word(WordCount **arr, int *size, int *cap, const char *word) {
     if (word[0] == '\0') return;
 
@@ -40,6 +41,32 @@ static void add_word(WordCount **arr, int *size, int *cap, const char *word) {
     (*size)++;
 }
 
+// Mergowanie do globalnej tablicy (jak w OpenMP)
+static void merge_word_global(WordCount **global, int *gsize, int *gcap,
+                              const char *word, long count) {
+    for (int i = 0; i < *gsize; i++) {
+        if (strcmp((*global)[i].word, word) == 0) {
+            (*global)[i].count += count;
+            return;
+        }
+    }
+
+    if (*gsize >= *gcap) {
+        *gcap *= 2;
+        WordCount *tmp = realloc(*global, (*gcap) * sizeof(WordCount));
+        if (!tmp) {
+            fprintf(stderr, "Brak pamięci w merge_word_global\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        *global = tmp;
+    }
+
+    (*global)[*gsize].word = strdup(word);
+    (*global)[*gsize].count = count;
+    (*gsize)++;
+}
+
+// Sortowanie TOP-N
 static int cmp_wordcount(const void *a, const void *b) {
     const WordCount *wa = a, *wb = b;
     if (wa->count < wb->count) return 1;
@@ -50,7 +77,6 @@ static int cmp_wordcount(const void *a, const void *b) {
 static void process_line_words(const char *line, WordCount **words, int *size, int *cap) {
     char buf[LINE_SIZE];
 
-    // znajdź początek treści (poziom logu)
     const char *msg = line;
     const char *p;
     if ((p = strstr(line, "INFO"))) msg = p;
@@ -111,9 +137,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // ========================
-    // Podział pliku na chunk'i
-    // ========================
+    // Podział pliku na fragmenty
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -122,18 +146,14 @@ int main(int argc, char *argv[]) {
     long start = rank * chunk;
     long end   = (rank == size - 1) ? fsize : (rank + 1) * chunk;
 
-    // skok do początku chunku
     fseek(f, start, SEEK_SET);
 
-    // jeżeli nie jesteśmy procesem 0, odetnij pierwszą niedokończoną linię
     if (rank != 0) {
         char tmp[LINE_SIZE];
         fgets(tmp, LINE_SIZE, f);
     }
 
-    // =====================================
     // Lokalne liczniki
-    // =====================================
     long local_info = 0, local_warn = 0, local_error = 0;
     long hourly_info[24] = {0};
     long hourly_warn[24] = {0};
@@ -166,9 +186,7 @@ int main(int argc, char *argv[]) {
 
     fclose(f);
 
-    // ===========================
-    // REDUKCJE
-    // ===========================
+    // REDUKCJE MPI
     long total_info, total_warn, total_error;
     MPI_Reduce(&local_info, &total_info, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_warn, &total_warn, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -182,15 +200,10 @@ int main(int argc, char *argv[]) {
     MPI_Reduce(hourly_warn,  global_hourly_warn,  24, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(hourly_error, global_hourly_error, 24, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    // ===========================
-    // REDUKCJA histogramu słów
-    // rank 0 zbiera
-    // ===========================
+    // GATHER słów
     if (rank != 0) {
-        // wyślij ile słów
         MPI_Send(&words_size, 1, MPI_INT, 0, 100, MPI_COMM_WORLD);
 
-        // wyślij każde słowo + count
         for (int i = 0; i < words_size; i++) {
             int len = strlen(words[i].word) + 1;
             MPI_Send(&len, 1, MPI_INT, 0, 101, MPI_COMM_WORLD);
@@ -206,13 +219,13 @@ int main(int argc, char *argv[]) {
     if (rank == 0) {
         global_words = malloc(gw_cap * sizeof(WordCount));
 
-        // dodaj lokalne słowa mastera
+        // lokalne słowa mastera
         for (int i = 0; i < words_size; i++) {
-            add_word(&global_words, &gw_size, &gw_cap, words[i].word);
-            global_words[gw_size - 1].count = words[i].count;
+            merge_word_global(&global_words, &gw_size, &gw_cap,
+                              words[i].word, words[i].count);
         }
 
-        // odbieraj z pozostałych procesów
+        // słowa z pozostałych procesów
         for (int r = 1; r < size; r++) {
 
             int count_words;
@@ -227,16 +240,15 @@ int main(int argc, char *argv[]) {
                 MPI_Recv(buffer, len, MPI_CHAR, r, 102, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 MPI_Recv(&c, 1, MPI_LONG, r, 103, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-                add_word(&global_words, &gw_size, &gw_cap, buffer);
-                global_words[gw_size - 1].count = c;
+                merge_word_global(&global_words, &gw_size, &gw_cap, buffer, c);
             }
         }
 
-        // sortowanie top-N
+        // sortowanie
         qsort(global_words, gw_size, sizeof(WordCount), cmp_wordcount);
 
         // ===========================
-        // WYPISANIE WYNIKÓW MPI
+        // WYNIKI MPI
         // ===========================
         printf("=== Analiza logów (MPI) ===\n");
         printf("Plik: %s\n", filename);
@@ -258,33 +270,6 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < limit; i++) {
             printf("%2d. %-20s %8ld\n",
                    i + 1, global_words[i].word, global_words[i].count);
-        }
-
-        // zapis wyników
-        FILE *out = fopen("results/results_mpi.txt", "w");
-        if (out) {
-            fprintf(out, "=== Analiza logów (MPI) ===\n");
-            fprintf(out, "Plik: %s\n", filename);
-            fprintf(out, "INFO:   %ld\n", total_info);
-            fprintf(out, "WARN:   %ld\n", total_warn);
-            fprintf(out, "ERROR:  %ld\n", total_error);
-
-            fprintf(out, "\nStatystyki godzinowe:\n");
-            fprintf(out, "Godz   INFO      WARN      ERROR\n");
-            for (int h = 0; h < 24; h++) {
-                fprintf(out, "%02d   %8ld  %8ld  %8ld\n",
-                        h, global_hourly_info[h],
-                        global_hourly_warn[h],
-                        global_hourly_error[h]);
-            }
-
-            fprintf(out, "\nTop-%d słów:\n", TOP_N);
-            for (int i = 0; i < limit; i++) {
-                fprintf(out, "%2d. %-20s %8ld\n",
-                        i + 1, global_words[i].word, global_words[i].count);
-            }
-
-            fclose(out);
         }
     }
 
